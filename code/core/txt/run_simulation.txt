@@ -1,0 +1,194 @@
+% =========================================================
+% Simulatore di Balistica Interna - Refactored Version
+% =========================================================
+% core/run_simulation.m
+% Funzione responsabile per:
+% 1. Impostare le opzioni dell'ODE solver (inclusa la funzione evento).
+% 2. Definire le condizioni iniziali per le variabili di stato.
+% 3. Preparare i parametri da passare alla funzione ODE e all'evento.
+% 4. Chiamare il solutore ODE (es. ode45).
+% 5. Estrarre i risultati grezzi dal solutore.
+% 6. Calcolare grandezze derivate post-simulazione (pressione, densità gas, ecc.).
+% 7. Ricalcolare le coppie nel tempo dai risultati (se necessario/desiderato).
+% 8. Restituire i risultati completi in una struct organizzata.
+% =========================================================
+
+function risultati = run_simulation(parametri)
+% INPUT:
+%   parametri: Struct completa contenente tutti i parametri necessari.
+% OUTPUT:
+%   risultati: Struct contenente i vettori temporali della simulazione:
+%              t, m_prop_rem, Tg, x_p, v_p, omega, Work_friction, Q_loss,
+%              pg, rho_g, V_inst, m_gas,
+%              TorqueR, TorqueE, TorqueF, NetTorque,
+%              te (event time), ye (event state), ie (event index)
+
+disp('Inizializzazione ODE solver...');
+
+% --- Impostazioni ODE Solver ---
+% --- Impostazioni ODE Solver ---
+options = odeset(...
+    'RelTol', 1e-5, ...
+    'AbsTol', 1e-7, ...
+    'NonNegative', [1, 3, 4, 5, 6, 7], ...
+    'Events', @(t,y) barrelExitEvent(t, y, parametri.barrel_length) ... % USA VERSIONE NON TERMINALE
+);
+fprintf('Opzioni ODE impostate. Evento NON TERMINALE: barrelExitEvent_NonTerminal @ x = %.4f m\n', parametri.barrel_length); % Aggiorna messaggio% --- Condizioni Iniziali ---
+% y = [m_prop_rem, T_gas, x_p, v_p, omega, Work_friction, Q_loss]
+initial_conditions = [
+    parametri.m_i, ...   % Massa propellente iniziale [kg]
+    parametri.T0, ...    % Temperatura gas iniziale [K] (uguale a T ambiente/canna)
+    0, ...               % Posizione proiettile iniziale [m]
+    0, ...               % Velocità proiettile iniziale [m/s]
+    0, ...               % Velocità angolare iniziale [rad/s]
+    0, ...               % Lavoro attrito lineare accumulato iniziale [J]
+    0                    % Calore perso accumulato iniziale [J]
+];
+disp('Condizioni iniziali definite:');
+disp(initial_conditions);
+
+% --- Intervallo di Tempo ---
+tspan = [0, parametri.t_max_safety]; % [s]
+fprintf('Intervallo di tempo: [%.f, %.4f] s\n', tspan(1), tspan(2));
+
+% --- Chiamata al Solutore ODE ---
+% La funzione ODE 'simulation_odes' ora riceve direttamente la struct 'parametri'.
+% Questo evita la lunga lista di parametri o la cell array, rendendo più
+% robusto il passaggio dei dati.
+t = []; solution = []; te = []; ye = []; ie = []; % Inizializza output ODE
+
+try
+    disp('Avvio integrazione ODE con ode45...');
+    [t, solution, te, ye, ie] = ode45(@(t,y) simulation_odes(t, y, parametri), tspan, initial_conditions, options);
+    disp('Integrazione ODE terminata.');
+
+    % Gestione fine simulazione (evento o tempo massimo)
+    if ~isempty(ie)
+        fprintf('Evento uscita canna (barrelExitEvent) rilevato a t = %.6f s (Indice %d)\n', te(end), ie(end));
+         % Potrebbe essere utile troncare i risultati al tempo dell'evento
+         % t = t(1:ie(end));
+         % solution = solution(1:ie(end),:);
+         % disp('Risultati troncati al tempo dell''evento.');
+         % Nota: Per ora manteniamo tutti i punti restituiti da ode45
+    elseif ~isempty(t)
+         warning('Simulazione interrotta al tempo massimo t_max_safety (%.4f s) PRIMA di raggiungere la lunghezza della canna (%.4f m).', t(end), parametri.barrel_length);
+    else
+         error('Il solutore ODE ode45 non ha prodotto risultati.');
+    end
+
+catch ME_ode
+    fprintf(2, 'Errore durante la chiamata a ode45 o alla funzione simulation_odes: %s\n', ME_ode.message);
+    fprintf(2, 'File: %s, Linea: %d\n', ME_ode.stack(1).file, ME_ode.stack(1).line);
+    risultati = []; % Restituisce vuoto in caso di fallimento ODE
+    return;
+end
+
+% --- Estrazione Risultati ODE e Calcoli Post-Simulazione ---
+if isempty(t) || size(solution, 2) ~= 7
+     error('Output da ode45 non valido o numero di colonne errato.');
+end
+
+disp('Estrazione risultati ODE e calcolo grandezze derivate...');
+risultati = struct();
+risultati.t           = t(:); % Assicura sia vettore colonna
+risultati.m_prop_rem  = solution(:, 1);
+risultati.Tg          = solution(:, 2);
+risultati.x_p         = solution(:, 3);
+risultati.v_p         = solution(:, 4);
+risultati.omega       = solution(:, 5); % [rad/s]
+risultati.Work_friction = solution(:, 6); % Lavoro attrito lineare [J]
+risultati.Q_loss      = solution(:, 7); % Calore perso [J]
+
+% Calcolo grandezze derivate (Pressione, Volume, Densità Gas, Massa Gas)
+risultati.m_gas = parametri.m_i - risultati.m_prop_rem;
+risultati.m_gas = max(risultati.m_gas, 1e-12); % Evita divisione per zero o log di zero
+
+risultati.V_inst = parametri.V0 + parametri.A_b .* risultati.x_p;
+risultati.V_inst = max(risultati.V_inst, 1e-12);
+
+effective_volume = risultati.V_inst - risultati.m_gas .* parametri.b_i;
+effective_volume = max(effective_volume, 1e-12); % Volume effettivo non può essere <= 0
+
+risultati.pg = (risultati.m_gas .* parametri.R_gas .* risultati.Tg) ./ effective_volume; % Pressione [Pa]
+risultati.pg = max(risultati.pg, 1e-3); % Evita pressioni negative o troppo basse
+
+risultati.rho_g = risultati.m_gas ./ risultati.V_inst; % Densità media gas [kg/m^3]
+risultati.rho_g = max(risultati.rho_g, 1e-6);
+
+disp('Grandezze derivate (pg, rho_g, V_inst, m_gas) calcolate.');
+
+% --- Ricalcolo Coppie (Torques) ---
+% Questo blocco ricalcola le coppie usando i risultati della simulazione.
+% È utile per avere i valori esatti ad ogni step temporale salvato.
+fprintf('Ricalcolo delle coppie dalla soluzione ODE...\n');
+num_steps = length(risultati.t);
+risultati.TorqueR = zeros(num_steps, 1); % Coppia Rigatura [N*m]
+risultati.TorqueE = zeros(num_steps, 1); % Coppia Incisione [N*m]
+risultati.TorqueF = zeros(num_steps, 1); % Coppia Attrito Rotazionale [N*m]
+risultati.NetTorque = zeros(num_steps, 1);% Coppia Netta [N*m]
+
+% Parametri necessari per il calcolo delle coppie
+A_b       = parametri.A_b;
+twist     = parametri.twist_rad_per_meter;
+T_eng_val = parametri.Torque_engrave_value;
+x_eng_end = parametri.x_p_engrave_end;
+mu_rot    = parametri.mu_rot_friction;
+D_bore    = parametri.D_bore;
+P_ss      = parametri.P_shot_start;
+I_p       = parametri.I_p; % Serve per coerenza, anche se non usato direttamente qui
+
+r_bore = D_bore / 2;
+% Precalcola termini costanti se possibile
+% Forma semplificata usata nelle EDO originali: tan(atan(twist*r_bore)) * r_bore = twist * r_bore^2
+rifling_factor = twist * r_bore^2; % Termine per TorqueR
+rot_fric_factor = mu_rot * r_bore; % Termine per TorqueF
+
+for i = 1:num_steps
+    current_pg = risultati.pg(i);
+    current_xp = risultati.x_p(i);
+
+    % Applica la logica di attivazione (es. P > P_shot_start)
+    if current_pg > P_ss && current_xp >= 0 % Assicurati che ci sia pressione e moto potenziale
+
+        force_pressure_i = current_pg * A_b;
+
+        % Coppia Rigatura (Tangente angolo * raggio * Forza Pressione)
+        % Torque = Fp * tan(alpha) * r, dove tan(alpha) = twist * r
+        % Torque = Fp * (twist * r) * r = Fp * twist * r^2
+        risultati.TorqueR(i) = force_pressure_i * rifling_factor;
+
+        % Coppia Incisione
+        if current_xp < x_eng_end
+            risultati.TorqueE(i) = T_eng_val;
+        else
+            risultati.TorqueE(i) = 0;
+        end
+
+        % Coppia Attrito Rotazionale (Forza Normale * coeff * raggio)
+        % Assumendo Forza Normale proporzionale a Forza Pressione
+        risultati.TorqueF(i) = force_pressure_i * rot_fric_factor; % Usa forza pressione come proxy per forza normale
+
+        % Coppia Netta (Accelerante - Resistente)
+        torque_resist_i = max(0, risultati.TorqueE(i) + risultati.TorqueF(i)); % Assicura non negativa
+        risultati.NetTorque(i) = risultati.TorqueR(i) - torque_resist_i;
+        % Nota: Questa coppia netta dovrebbe idealmente corrispondere a I_p * d(omega)/dt calcolato dalle EDO.
+        % Leggere differenze possono esistere a causa dell'integrazione numerica.
+
+    else
+        % Se pressione troppo bassa o proiettile fermo, coppie nulle
+        risultati.TorqueR(i) = 0;
+        risultati.TorqueE(i) = 0;
+        risultati.TorqueF(i) = 0;
+        risultati.NetTorque(i) = 0;
+    end
+end
+disp('Ricalcolo coppie completato.');
+
+% --- Aggiungi informazioni evento alla struct risultati ---
+risultati.te = te; % Tempo/i evento/i
+risultati.ye = ye; % Stato/i all'evento/i
+risultati.ie = ie; % Indice/i evento/i
+
+disp('Struct risultati finali assemblata.');
+
+end % Fine funzione run_simulation
