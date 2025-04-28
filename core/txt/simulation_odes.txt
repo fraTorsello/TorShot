@@ -1,0 +1,225 @@
+% =========================================================
+% Simulatore di Balistica Interna - Refactored Version
+% =========================================================
+% core/simulation_odes.m
+% Funzione che definisce il sistema di Equazioni Differenziali Ordinarie (EDO)
+% per il modello di balistica interna.
+% Calcola le derivate temporali delle variabili di stato.
+% Include: combustione polvere, moto proiettile (lineare e rotazionale),
+%          termodinamica gas (Noble-Able), resistenza tabulata,
+%          perdita di calore (semplice), bilancio energetico migliorato.
+%
+% NOTE:
+% - USA RESISTENZA TABULATA br(x_p) al posto di mu_fric.
+% - Implementa Gradiente Lagrange per P_base.
+% - Bilancio dT/dt include d(KE_gas)/dt e d(KE_rot)/dt.
+% =========================================================
+
+function dydt = simulation_odes(t, y, params)
+% INPUTS:
+%   t: Tempo corrente (scalare)
+%   y: Vettore stato [m_prop_rem; T_gas; x_p; v_p; omega; Work_bore_resistance; Q_loss]
+%   params: Struct parametri (DEVE includere br_travel_m e br_pressure_Pa)
+% OUTPUT:
+%   dydt: Vettore derivate [dm_prop_dt; dT_dt; dx_dt; dv_dt; domega_dt; dW_br_dt; dQ_loss_dt]
+
+% --- Estrai Variabili di Stato dal Vettore y ---
+m_prop_rem         = y(1); % Massa propellente rimanente [kg]
+T_gas              = y(2); % Temperatura media gas [K]
+x_p                = y(3); % Posizione proiettile [m]
+v_p                = y(4); % Velocità lineare proiettile [m/s]
+omega              = y(5); % Velocità angolare proiettile [rad/s]
+Work_bore_resistance = y(6); % Lavoro cumulativo contro resistenza br [J]
+Q_loss             = y(7); % Calore cumulativo perso (pareti) [J]
+
+% --- Estrai Parametri Necessari dalla Struct params ---
+% Parametri principali
+m_i       = params.m_i;       % Massa iniziale propellente [kg] (Usato come CT)
+m_p       = params.m_p;       % Massa proiettile [kg]
+A_b       = params.A_b;       % Area base proiettile [m^2]
+V0        = params.V0;        % Volume iniziale camera [m^3]
+rho_i     = params.rho_i;     % Densità propellente solido [kg/m^3]
+b_i       = params.b_i;       % Covolume gas [m^3/kg]
+gamma_i   = params.gamma_i;   % Rapporto calori specifici gas [-]
+R_gas     = params.R_gas;     % Costante gas specifica [J/(kg*K)]
+F_i       = params.F_i;       % Impetus / Forza specifica propellente [J/kg]
+% Combustione
+a_i       = params.a_i;       % Coefficiente legge combustione [m/s / Pa^beta]
+beta_i    = params.beta_i;    % Esponente legge combustione [-]
+S0        = params.S0;        % Area superficiale iniziale propellente [m^2]
+theta     = params.theta;     % Parametro funzione di forma [-]
+% Moto rotazionale
+I_p       = params.I_p;       % Momento d'inerzia proiettile [kg*m^2]
+twist     = params.twist_rad_per_meter; % Passo rigatura [rad/m]
+T_eng_val = params.Torque_engrave_value; % Coppia incisione [N*m] (Potrebbe essere inclusa in br?)
+x_eng_end = params.x_p_engrave_end;     % Fine corsa incisione [m] (Potrebbe essere legata a br?)
+mu_rot    = params.mu_rot_friction;     % Coefficiente attrito rotazionale [-] (Mantenuto per ora)
+D_bore    = params.D_bore;    % Diametro canna [m]
+% Condizioni iniziali e Resistenza
+P_ss      = params.P_shot_start; % Pressione minima per moto [Pa]
+br_travel_m    = params.br_travel_m;    % Vettore posizioni per br [m]
+br_pressure_Pa = params.br_pressure_Pa; % Vettore pressioni resistenti br [Pa]
+% Gestione pgas
+if isfield(params, 'pgas'), pgas = params.pgas; else, warning('ID:pgas','pgas non trovato, uso 0 Pa.'); pgas = 0.0; end
+if ~isnumeric(pgas) || ~isscalar(pgas) || pgas < 0, warning('ID:pgasInv','pgas non valido, uso 0 Pa.'); pgas = 0.0; end
+% Parametri Heat Loss
+h_conv    = params.h_conv;    % Coefficiente scambio termico [W/(m^2*K)]
+T0_barrel = params.T0;        % Temperatura iniziale canna [K]
+
+% --- Validazione Input br (base) ---
+if length(br_travel_m) ~= length(br_pressure_Pa) || length(br_travel_m) < 2
+    error('I vettori br_travel_m e br_pressure_Pa devono avere la stessa lunghezza (>= 2).');
+end
+if ~issorted(br_travel_m) || any(br_travel_m < 0)
+     error('Il vettore br_travel_m deve essere monotono crescente e non negativo.');
+end
+% Opzionale: verifica se la pressione br è sempre non negativa
+% if any(br_pressure_Pa < 0)
+%     warning('ID:brNeg','Il vettore br_pressure_Pa contiene valori negativi. Saranno limitati a 0.');
+%     br_pressure_Pa(br_pressure_Pa < 0) = 0;
+% end
+
+% --- Protezioni per Valori Non Fisici ---
+m_prop_rem = max(1e-12, m_prop_rem);
+T_gas      = max(T0_barrel, T_gas);
+v_p        = max(0, v_p);
+omega      = max(0, omega);
+% Assicura che x_p sia all'interno o all'inizio del range definito per br
+x_p = max(br_travel_m(1), x_p);
+
+% --- Calcoli Intermedi Fondamentali ---
+m_gas = m_i - m_prop_rem; % Massa gas attuale [kg]
+m_gas = max(1e-12, m_gas); % Evita massa nulla
+
+V_inst = V0 + A_b * x_p; % Volume istantaneo disponibile [m^3]
+V_inst = max(1e-12, V_inst);
+
+% Calore specifico a volume costante (Cv)
+if gamma_i <= 1, error('gamma_i deve essere > 1 (valore: %.3f)', gamma_i); end
+Cv = R_gas / (gamma_i - 1); % [J/(kg*K)]
+Cv = max(1e-6, Cv); % Evita Cv nullo o negativo
+
+% Pressione Media Gas (Legge Noble-Able)
+effective_volume = V_inst - m_gas * b_i;
+effective_volume = max(1e-9, effective_volume); % Evita volume non fisico
+P_gas = (m_gas * R_gas * T_gas) / effective_volume; % [Pa]
+P_gas = max(1e3, P_gas); % Evita pressioni negative o troppo basse
+
+% --- Calcolo Tasso di Combustione Propellente ---
+burning_surface_area = 0;
+burn_rate = 0;
+dm_prop_dt = 0; % Derivata massa propellente [kg/s]
+dm_g_dt = 0;    % Derivata massa gas [kg/s]
+
+if m_prop_rem > 1e-9 * m_i
+    f = (m_i - m_prop_rem) / m_i; f = max(0, min(f, 1));
+    Z_f = (1 - f) * (1 + theta * f); Z_f = max(0, Z_f);
+    burning_surface_area = S0 * Z_f; % [m^2]
+    burn_rate = a_i * (P_gas^beta_i); burn_rate = max(0, burn_rate); % [m/s]
+    dm_prop_dt = -rho_i * burning_surface_area * burn_rate; % [kg/s]
+    dm_prop_dt = min(0, dm_prop_dt);
+    dm_g_dt = -dm_prop_dt;
+end
+
+% --- Calcolo Resistenze, Pressioni, Coppie ---
+
+% Interpolazione Resistenza Tabulata br
+% 'extrap' usa il valore all'estremo più vicino se x_p è fuori dal range
+% Assicurati che i vettori siano colonne per interp1 se necessario
+br_current_Pa = interp1(br_travel_m(:), br_pressure_Pa(:), x_p, 'linear', 'extrap');
+br_current_Pa = max(0, br_current_Pa); % Forza br >= 0 Pa
+
+% Pressione Esterna 'Pg'
+external_pressure_Pg = pgas; % [Pa]
+
+% Pressione alla Base Proiettile (P_base) - Gradiente Lagrange
+CT = m_i; % Approssima C_T con massa propellente iniziale
+lagrange_numerator = P_gas + (CT * (br_current_Pa + external_pressure_Pg)) / (3.0 * m_p);
+lagrange_denominator = 1.0 + (CT / (3.0 * m_p));
+if abs(lagrange_denominator) < 1e-9, P_base = P_gas; else, P_base = lagrange_numerator / lagrange_denominator; end
+P_base = max(0, P_base); % [Pa]
+
+% Coppie agenti sul proiettile
+% Nota: Si continua ad usare P_gas per le coppie per semplicità/coerenza precedente.
+% L'attrito rotazionale è ancora legato a mu_rot. Se br include tutto, rimuovere mu_rot/torque_rot_fric.
+force_pressure_mean = P_gas * A_b;
+r_bore = D_bore / 2.0;
+torque_rifling = force_pressure_mean * twist * r_bore^2;
+torque_engrave = (x_p < x_eng_end) * T_eng_val; % Potrebbe essere ridondante se incluso in br(x)
+torque_rot_fric = force_pressure_mean * mu_rot * r_bore; % Attrito rotazionale separato
+torque_resist = max(0, torque_engrave + torque_rot_fric); % Considera se rimuovere torque_engrave
+net_torque = torque_rifling - torque_resist;
+
+% --- Calcolo delle Derivate delle Variabili di Stato ---
+dydt = zeros(7, 1);
+
+% 1. Derivata Massa Propellente [kg/s]
+dydt(1) = dm_prop_dt;
+
+% 2. Derivata Posizione Proiettile [m/s]
+dx_dt = v_p;
+dydt(3) = dx_dt;
+
+% 3. Derivata Velocità Lineare Proiettile (Accelerazione) [m/s^2]
+dv_dt = 0;
+% Forza Netta Accelerante [N] = Forza Pressione Base - Forza Resistenza br - Forza Pressione Esterna
+net_force_linear = (P_base * A_b) - (br_current_Pa * A_b) - (external_pressure_Pg * A_b);
+% Condizioni per l'accelerazione (P_gas > P_ss solo per avvio?)
+if net_force_linear > 0 && P_gas > P_ss % Inizia a muoversi solo sopra P_ss
+   if m_p > 1e-9, dv_dt = net_force_linear / m_p; end
+elseif net_force_linear < 0 && v_p > 0 % Permette decelerazione
+    if m_p > 1e-9, dv_dt = net_force_linear / m_p; end
+else % Fermo o forza non sufficiente/negativa da fermo
+    dv_dt = 0;
+end
+dydt(4) = dv_dt;
+
+% 4. Derivata Velocità Angolare Proiettile (Accelerazione Angolare) [rad/s^2]
+domega_dt = 0;
+if net_torque > 0 && P_gas > P_ss
+    if I_p > 1e-12, domega_dt = net_torque / I_p; end
+elseif net_torque < 0 && omega > 0
+    if I_p > 1e-12, domega_dt = net_torque / I_p; end
+else
+    domega_dt = 0;
+end
+dydt(5) = domega_dt;
+
+% 5. Derivata Lavoro contro Resistenza Bore (dW_br/dt) [J/s = W]
+if v_p > 0
+    force_br = br_current_Pa * A_b; % Forza resistente istantanea [N]
+    dW_br_dt = force_br * v_p; % Potenza dissipata [W]
+else
+    dW_br_dt = 0; % Nessun lavoro se fermo
+end
+dydt(6) = dW_br_dt;
+
+% 6. Derivata Temperatura Gas (Bilancio Energetico RIVISTO) [K/s]
+dT_dt = 0;
+dQ_loss_dt = 0;
+if m_gas > 1e-9 && Cv > 0
+    % Termini energetici (W)
+    energy_input_rate_term = dm_g_dt * (F_i - Cv * T_gas);
+    work_done_rate = P_base * A_b * v_p; % Usa P_base
+    work_done_rate = max(0, work_done_rate);
+    % Perdita calore (Modello semplice)
+    A_camera_stimata = 1e-3; A_cilindro_scoperto = pi * D_bore * max(0, x_p); A_contact = A_camera_stimata + A_cilindro_scoperto;
+    if T_gas > T0_barrel, dQ_loss_dt = h_conv * A_contact * (T_gas - T0_barrel); dQ_loss_dt = max(0, dQ_loss_dt); else, dQ_loss_dt = 0; end
+    % Tasso KE Gas (Approx Lagrange)
+    dEp_dt_lagrange = (CT / 3.0) * v_p * dv_dt;
+    % Tasso KE Rotazionale
+    dEpr_dt = params.I_p * omega * domega_dt;
+    % Bilancio
+    dT_dt_numerator = energy_input_rate_term - work_done_rate - dQ_loss_dt - dEp_dt_lagrange - dEpr_dt;
+    dT_dt_denominator = m_gas * Cv;
+    if abs(dT_dt_denominator) < 1e-9, dT_dt = 0; else, dT_dt = dT_dt_numerator / dT_dt_denominator; end
+else
+    dT_dt = 0; dQ_loss_dt = 0;
+end
+dydt(2) = dT_dt;
+
+% 7. Derivata Calore Perso (verso pareti) [J/s = W]
+dydt(7) = dQ_loss_dt;
+
+% --- Fine Calcolo Derivate ---
+end % Fine funzione simulation_odes
