@@ -2,10 +2,6 @@
 
 **Development and Analysis of a Lumped Parameter Model for Predicting Small Caliber Ammunition Performance**
 
-*Author: Francesco Torsello*
-*Institution: Politecnico di Milano* [cite: 2]
-
----
 
 ## Overview
 
